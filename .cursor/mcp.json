@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "geo-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/geo-mcp",
+        "run",
+        "geo-mcp"
+      ],
+      "env": {
+        "PYTHONWARNINGS": "ignore"
+      }
+    }
+  }
+}
