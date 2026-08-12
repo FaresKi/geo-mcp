@@ -5,21 +5,20 @@ from dataclasses import dataclass
 
 from geo_mcp.application.dto import LoadAreaResult
 from geo_mcp.application.mappers import bbox_to_dto
+from geo_mcp.application.session import AreaSession
+from geo_mcp.domain.config import RoutingConfig
+from geo_mcp.domain.deadline import Deadline
 from geo_mcp.domain.model.geo import BoundingBox, GeoPoint
-from geo_mcp.domain.ports import GeocoderPort
-from geo_mcp.infrastructure.config import Settings
-from geo_mcp.infrastructure.graph.tile_store import TileGraphStore
-from geo_mcp.infrastructure.osm.network_repository import AreaSession, OsmNetworkRepository
-from geo_mcp.infrastructure.resilience.deadline import Deadline
+from geo_mcp.domain.ports import GeocoderPort, NetworkRepositoryPort, TileGraphPort
 
 
 @dataclass
 class LoadAreaUseCase:
     geocoder: GeocoderPort
-    networks: OsmNetworkRepository
-    tiles: TileGraphStore
+    networks: NetworkRepositoryPort
+    tiles: TileGraphPort
     session: AreaSession
-    settings: Settings
+    config: RoutingConfig
 
     def execute(
         self,
@@ -42,14 +41,14 @@ class LoadAreaUseCase:
             if found.bbox is not None:
                 bbox = found.bbox
                 lat_span, lon_span = bbox.spans()
-                max_span = self.settings.place_bbox_max_span_deg
+                max_span = self.config.place_bbox_max_span_deg
                 if lat_span > max_span or lon_span > max_span:
                     bbox = BoundingBox.from_center(
-                        found.point, self.settings.default_area_half_size_deg
+                        found.point, self.config.default_area_half_size_deg
                     )
             else:
                 bbox = BoundingBox.from_center(
-                    found.point, self.settings.default_area_half_size_deg
+                    found.point, self.config.default_area_half_size_deg
                 )
         else:
             if None in (south, west, north, east):
@@ -60,16 +59,15 @@ class LoadAreaUseCase:
             on_progress(5, 100, f"Resolving area {label}")
 
         lat_span, lon_span = bbox.spans()
-        # Large explicit bboxes load as parallel tiles instead of one OSMnx call.
         use_tiles = (
-            lat_span > self.settings.tile_size_deg * 1.5
-            or lon_span > self.settings.tile_size_deg * 1.5
+            lat_span > self.config.tile_size_deg * 1.5
+            or lon_span > self.config.tile_size_deg * 1.5
         )
         cached_before = self.networks.get_cached(bbox) is not None and not force_refresh
 
         if use_tiles:
             tile_ids = self.tiles.tiles_for_bbox(
-                bbox, max_tiles=max(self.settings.max_walk_tiles, 25)
+                bbox, max_tiles=max(self.config.max_walk_tiles, 25)
             )
             if on_progress:
                 on_progress(10, 100, f"Loading {len(tile_ids)} tiles")
@@ -77,7 +75,7 @@ class LoadAreaUseCase:
                 tile_ids,
                 layer="full",
                 force_refresh=force_refresh,
-                deadline=Deadline.from_seconds(self.settings.operation_deadline_s),
+                deadline=Deadline.from_seconds(self.config.operation_deadline_s),
                 on_progress=lambda d, t, m: on_progress(
                     10 + 80 * (d / max(t, 1)), 100, m
                 )

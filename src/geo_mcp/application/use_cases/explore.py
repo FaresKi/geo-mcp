@@ -4,10 +4,9 @@ from dataclasses import dataclass
 
 from geo_mcp.application.dto import AreaDescriptionDTO, PoiDTO, TransitStopDTO
 from geo_mcp.application.mappers import bbox_to_dto, point_to_dto
+from geo_mcp.application.session import AreaSession
 from geo_mcp.domain.model.geo import GeoPoint
-from geo_mcp.domain.ports import PoiSearchPort
-from geo_mcp.infrastructure.osm.network_repository import AreaSession, OsmNetworkRepository
-from geo_mcp.infrastructure.osm.overpass import OverpassClient
+from geo_mcp.domain.ports import FeatureDescribePort, PoiSearchPort, TransitRepositoryPort
 
 
 @dataclass
@@ -43,7 +42,7 @@ class FindNearbyUseCase:
 
 @dataclass
 class ListTransitOptionsUseCase:
-    networks: OsmNetworkRepository
+    transit: TransitRepositoryPort
     session: AreaSession
 
     def execute(
@@ -55,7 +54,7 @@ class ListTransitOptionsUseCase:
         limit: int = 20,
     ) -> list[TransitStopDTO]:
         point = GeoPoint(lat=lat, lon=lon)
-        stops = self.networks.list_stops_nearby(point, radius_m=radius_m, limit=limit)
+        stops = self.transit.list_stops_nearby(point, radius_m=radius_m, limit=limit)
         result: list[TransitStopDTO] = []
         for stop in stops:
             lines = list(stop.lines)
@@ -77,8 +76,7 @@ class ListTransitOptionsUseCase:
 @dataclass
 class DescribeAreaUseCase:
     session: AreaSession
-    overpass: OverpassClient
-    networks: OsmNetworkRepository
+    features: FeatureDescribePort
 
     def execute(self) -> AreaDescriptionDTO:
         graph = self.session.graph
@@ -91,10 +89,9 @@ class DescribeAreaUseCase:
             "neighborhoods": [],
             "landmarks": graph.landmarks,
         }
-        # Enrich if sparse.
         if len(features["major_roads"]) < 3 or len(features["landmarks"]) < 2:
             try:
-                features = self.overpass.describe_features(bbox)
+                features = self.features.describe_features(bbox)
             except Exception:
                 pass
 
