@@ -3,7 +3,9 @@ from __future__ import annotations
 import atexit
 from dataclasses import dataclass
 
+from geo_mcp.application.services.adaptive_router import AdaptiveRouter
 from geo_mcp.application.services.job_service import InMemoryJobStore, JobService
+from geo_mcp.application.session import AreaSession
 from geo_mcp.application.use_cases import (
     DescribeAreaUseCase,
     FindNearbyUseCase,
@@ -14,13 +16,12 @@ from geo_mcp.application.use_cases import (
     ReverseGeocodeUseCase,
     SnapToNetworkUseCase,
 )
-from geo_mcp.domain.services.hierarchical_router import AdaptiveRouter
 from geo_mcp.domain.services.pathfinding import PathfindingService
 from geo_mcp.domain.services.routing_strategy import RoutingStrategySelector
 from geo_mcp.infrastructure.config import Settings, get_settings
 from geo_mcp.infrastructure.graph.cache import DiskGraphCache
 from geo_mcp.infrastructure.graph.tile_store import TileGraphStore
-from geo_mcp.infrastructure.osm.network_repository import AreaSession, OsmNetworkRepository
+from geo_mcp.infrastructure.osm.network_repository import OsmNetworkRepository
 from geo_mcp.infrastructure.osm.nominatim import NominatimGeocoder
 from geo_mcp.infrastructure.osm.overpass import OverpassClient
 from geo_mcp.infrastructure.osm.pbf_builder import PbfNetworkBuilder
@@ -56,6 +57,7 @@ class AppContainer:
 
 def build_container(settings: Settings | None = None) -> AppContainer:
     settings = settings or get_settings()
+    routing = settings.routing_config()
     geocoder = NominatimGeocoder(settings)
     overpass = OverpassClient(settings)
     cache = DiskGraphCache(settings)
@@ -70,9 +72,9 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         transfer_penalty_s=settings.transfer_penalty_s,
         line_change_penalty_s=settings.line_change_penalty_s,
     )
-    selector = RoutingStrategySelector(local_max_m=settings.local_max_m)
+    selector = RoutingStrategySelector(local_max_m=routing.local_max_m)
     router = AdaptiveRouter(
-        settings=settings,
+        config=routing,
         tiles=tiles,
         pathfinder=pathfinder,
         selector=selector,
@@ -93,14 +95,14 @@ def build_container(settings: Settings | None = None) -> AppContainer:
         pathfinder=pathfinder,
         router=router,
         jobs=jobs,
-        load_area=LoadAreaUseCase(geocoder, networks, tiles, session, settings),
+        load_area=LoadAreaUseCase(geocoder, networks, tiles, session, routing),
         geocode=GeocodeUseCase(geocoder),
         reverse_geocode=ReverseGeocodeUseCase(geocoder),
-        plan_route=PlanRouteUseCase(router, jobs, settings),
+        plan_route=PlanRouteUseCase(router, jobs, routing),
         find_nearby=FindNearbyUseCase(overpass),
         list_transit_options=ListTransitOptionsUseCase(networks, session),
-        describe_area=DescribeAreaUseCase(session, overpass, networks),
-        snap_to_network=SnapToNetworkUseCase(session, router, settings),
+        describe_area=DescribeAreaUseCase(session, overpass),
+        snap_to_network=SnapToNetworkUseCase(session, tiles, routing),
     )
     atexit.register(container.close)
     return container

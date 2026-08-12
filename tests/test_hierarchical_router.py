@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from geo_mcp.application.services.adaptive_router import AdaptiveRouter
 from geo_mcp.application.services.job_service import InMemoryJobStore, JobService
+from geo_mcp.application.session import AreaSession
 from geo_mcp.application.use_cases.routing import PlanRouteUseCase
+from geo_mcp.domain.config import RoutingConfig
 from geo_mcp.domain.model.geo import BoundingBox, GeoPoint
 from geo_mcp.domain.model.network import EdgeMode, GraphEdge, GraphNode, NetworkGraph
 from geo_mcp.domain.model.transit import TransitLine, TransitStop
-from geo_mcp.domain.services.hierarchical_router import AdaptiveRouter
 from geo_mcp.domain.services.pathfinding import PathfindingService
 from geo_mcp.domain.services.routing_strategy import RoutingStrategySelector
-from geo_mcp.infrastructure.config import Settings
-from geo_mcp.infrastructure.osm.network_repository import AreaSession
 
 
 def _stop(sid: str, lat: float, lon: float, name: str) -> GraphNode:
@@ -50,7 +50,6 @@ class FakeTileStore:
         key = f"{round(point.lat, 2)}:{round(point.lon, 2)}"
         if key in self.walk_graphs:
             return self.walk_graphs[key]
-        # nearest fake walk graph
         if self.walk_graphs:
             return next(iter(self.walk_graphs.values()))
         return NetworkGraph()
@@ -101,28 +100,9 @@ def _build_corridor_fakes() -> tuple[FakeTileStore, GeoPoint, GeoPoint]:
             travel_time_s=80,
         )
     )
-    walk_o.add_edge(
-        GraphEdge(
-            source_id="wo2",
-            target_id="wo",
-            mode=EdgeMode.WALK,
-            length_m=120,
-            travel_time_s=80,
-        )
-    )
-
     walk_d = NetworkGraph()
     walk_d.add_node(_walk_node("wd", 0.05, 0.0))
     walk_d.add_node(_walk_node("wd2", 0.049, 0.0))
-    walk_d.add_edge(
-        GraphEdge(
-            source_id="wd2",
-            target_id="wd",
-            mode=EdgeMode.WALK,
-            length_m=120,
-            travel_time_s=80,
-        )
-    )
     walk_d.add_edge(
         GraphEdge(
             source_id="wd",
@@ -136,17 +116,27 @@ def _build_corridor_fakes() -> tuple[FakeTileStore, GeoPoint, GeoPoint]:
     store = FakeTileStore(
         transit_graph=transit,
         stops=[
-            TransitStop(id="stop:o", name="Origin Stop", point=GeoPoint(0.001, 0.0)),
-            TransitStop(id="stop:m", name="Mid Stop", point=GeoPoint(0.025, 0.0)),
-            TransitStop(id="stop:d", name="Dest Stop", point=GeoPoint(0.049, 0.0)),
-        ],
-        lines=[
-            TransitLine(
-                ref="RER",
-                name="RER",
-                mode="train",
-                stop_ids=("stop:o", "stop:m", "stop:d"),
-            )
+            TransitStop(
+                id="stop:o",
+                name="Origin Stop",
+                point=GeoPoint(0.001, 0.0),
+                modes=("train",),
+                lines=("RER",),
+            ),
+            TransitStop(
+                id="stop:m",
+                name="Mid Stop",
+                point=GeoPoint(0.025, 0.0),
+                modes=("train",),
+                lines=("RER",),
+            ),
+            TransitStop(
+                id="stop:d",
+                name="Dest Stop",
+                point=GeoPoint(0.049, 0.0),
+                modes=("train",),
+                lines=("RER",),
+            ),
         ],
         walk_graphs={
             "0.0:0.0": walk_o,
@@ -158,10 +148,10 @@ def _build_corridor_fakes() -> tuple[FakeTileStore, GeoPoint, GeoPoint]:
 
 def test_hierarchical_route_stitches_transit() -> None:
     store, origin, dest = _build_corridor_fakes()
-    settings = Settings(local_max_m=2000, access_radius_m=500)
+    config = RoutingConfig(local_max_m=2000, access_radius_m=500)
     router = AdaptiveRouter(
-        settings=settings,
-        tiles=store,  # type: ignore[arg-type]
+        config=config,
+        tiles=store,
         pathfinder=PathfindingService(),
         selector=RoutingStrategySelector(local_max_m=2000),
         session=AreaSession(),
@@ -174,7 +164,7 @@ def test_hierarchical_route_stitches_transit() -> None:
 
 
 def test_local_route_uses_session_graph() -> None:
-    settings = Settings(local_max_m=5000)
+    config = RoutingConfig(local_max_m=5000)
     session = AreaSession()
     g = NetworkGraph(bbox=BoundingBox(-0.01, -0.01, 0.01, 0.01))
     g.add_node(_walk_node("a", 0.0, 0.0))
@@ -192,30 +182,29 @@ def test_local_route_uses_session_graph() -> None:
     session.bbox = g.bbox
     store = FakeTileStore()
     router = AdaptiveRouter(
-        settings=settings,
-        tiles=store,  # type: ignore[arg-type]
+        config=config,
+        tiles=store,
         pathfinder=PathfindingService(),
         selector=RoutingStrategySelector(local_max_m=5000),
         session=session,
     )
     itin = router.route(GeoPoint(0.0, 0.0), GeoPoint(0.0, 0.001), modes=["walk"])
     assert itin.modes_used == ("walk",)
-    assert store.calls == []  # used session graph
+    assert store.calls == []
 
 
 def test_plan_route_defers_long_trips() -> None:
     store, origin, dest = _build_corridor_fakes()
-    # Auto-defer when distance > local_max_m * 3
-    settings = Settings(local_max_m=1000)
+    config = RoutingConfig(local_max_m=1000)
     router = AdaptiveRouter(
-        settings=settings,
-        tiles=store,  # type: ignore[arg-type]
+        config=config,
+        tiles=store,
         pathfinder=PathfindingService(),
         selector=RoutingStrategySelector(local_max_m=1000),
         session=AreaSession(),
     )
     jobs = JobService(InMemoryJobStore(), max_workers=2)
-    use_case = PlanRouteUseCase(router=router, jobs=jobs, settings=settings)
+    use_case = PlanRouteUseCase(router=router, jobs=jobs, config=config)
     result = use_case.execute(
         origin_lat=origin.lat,
         origin_lon=origin.lon,
@@ -228,7 +217,7 @@ def test_plan_route_defers_long_trips() -> None:
 
 
 def test_plan_route_sync_short() -> None:
-    settings = Settings(local_max_m=5000)
+    config = RoutingConfig(local_max_m=5000)
     session = AreaSession()
     g = NetworkGraph(bbox=BoundingBox(-0.01, -0.01, 0.01, 0.01))
     g.add_node(_walk_node("a", 0.0, 0.0))
@@ -245,8 +234,8 @@ def test_plan_route_sync_short() -> None:
     session.graph = g
     session.bbox = g.bbox
     router = AdaptiveRouter(
-        settings=settings,
-        tiles=FakeTileStore(),  # type: ignore[arg-type]
+        config=config,
+        tiles=FakeTileStore(),
         pathfinder=PathfindingService(),
         selector=RoutingStrategySelector(local_max_m=5000),
         session=session,
@@ -254,7 +243,7 @@ def test_plan_route_sync_short() -> None:
     use_case = PlanRouteUseCase(
         router=router,
         jobs=JobService(InMemoryJobStore(), max_workers=1),
-        settings=settings,
+        config=config,
     )
     result = use_case.execute(
         origin_lat=0.0,
