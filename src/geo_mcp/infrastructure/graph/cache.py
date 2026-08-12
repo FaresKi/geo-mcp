@@ -10,7 +10,7 @@ from geo_mcp.infrastructure.config import Settings
 
 logger = logging.getLogger(__name__)
 
-CACHE_VERSION = 2
+CACHE_VERSION = 5
 
 
 class DiskGraphCache:

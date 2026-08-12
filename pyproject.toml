@@ -1,6 +1,6 @@
 [project]
 name = "geo-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "OSM multimodal navigation MCP server for LLM geo reasoning"
 readme = "README.md"
 authors = [

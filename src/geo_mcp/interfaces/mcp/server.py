@@ -1,47 +1,84 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from geo_mcp.container import AppContainer, build_container
 
 logger = logging.getLogger(__name__)
 
 
-def create_mcp_server(container: AppContainer | None = None) -> FastMCP:
+def create_mcp_server(
+    container: AppContainer | None = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> FastMCP:
     container = container or build_container()
     mcp = FastMCP(
         "geo-mcp",
         instructions=(
-            "OSM-backed multimodal (walk + transit) navigation tools. "
-            "Always call load_area for the city/neighborhood before routing or "
-            "describe_area. Prefer structured coordinates from geocode over guessing."
+            "OSM-backed multimodal (walk + transit) navigation tools with "
+            "distance-adaptive routing. Prefer geocode for coordinates. "
+            "plan_route auto-loads tiles and works for short or long trips; "
+            "long routes may return a job_id — poll get_job until completed. "
+            "load_area is optional prefetch for explore/describe_area."
         ),
+        host=host,
+        port=port,
     )
 
+    def _progress_callback(ctx: Context):
+        loop = asyncio.get_running_loop()
+
+        def progress(p: float, total: float | None, message: str) -> None:
+            async def _send() -> None:
+                try:
+                    await ctx.report_progress(
+                        progress=p, total=total, message=message
+                    )
+                except Exception:
+                    logger.debug("progress notification failed", exc_info=True)
+
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_send(), loop)
+                fut.result(timeout=2.0)
+            except Exception:
+                logger.debug("progress schedule failed", exc_info=True)
+
+        return progress
+
     @mcp.tool()
-    def load_area(
+    async def load_area(
         place: str | None = None,
         south: float | None = None,
         west: float | None = None,
         north: float | None = None,
         east: float | None = None,
         force_refresh: bool = False,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Load and cache OSM walk+transit graph for a place name or bounding box.
 
-        Prefer a place query (e.g. "Le Marais, Paris") or an explicit bbox.
-        Must be called before plan_route, describe_area, or snap_to_network.
+        Large bboxes are fetched as parallel tiles. Prefer a place query for explore.
+        Optional before plan_route; useful for describe_area.
         """
-        result = container.load_area.execute(
-            place=place,
-            south=south,
-            west=west,
-            north=north,
-            east=east,
-            force_refresh=force_refresh,
+        import anyio
+
+        on_progress = _progress_callback(ctx) if ctx is not None else None
+        result = await anyio.to_thread.run_sync(
+            lambda: container.load_area.execute(
+                place=place,
+                south=south,
+                west=west,
+                north=north,
+                east=east,
+                force_refresh=force_refresh,
+                on_progress=on_progress,
+            )
         )
         return result.model_dump()
 
@@ -57,26 +94,81 @@ def create_mcp_server(container: AppContainer | None = None) -> FastMCP:
         return place.model_dump() if place else None
 
     @mcp.tool()
-    def plan_route(
+    async def plan_route(
         origin_lat: float,
         origin_lon: float,
         destination_lat: float,
         destination_lon: float,
         modes: list[str] | None = None,
+        defer: bool = False,
+        force_strategy: str | None = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
-        """Plan a multimodal route on the loaded area graph.
+        """Plan a multimodal route for any distance.
 
-        modes defaults to walk+transit. Use ["walk"] for pedestrian-only.
-        Requires a prior successful load_area call.
+        Auto-selects local A* or hierarchical transit-first routing.
+        Long trips may return {job_id, status} — use get_job to poll.
+        Set defer=true to always run in the background.
+        force_strategy: "local" | "hierarchical".
         """
-        result = container.plan_route.execute(
+        import anyio
+
+        on_progress = _progress_callback(ctx) if ctx is not None else None
+        result = await anyio.to_thread.run_sync(
+            lambda: container.plan_route.execute(
+                origin_lat=origin_lat,
+                origin_lon=origin_lon,
+                destination_lat=destination_lat,
+                destination_lon=destination_lon,
+                modes=modes,
+                defer=defer,
+                force_strategy=force_strategy,
+                on_progress=on_progress,
+            )
+        )
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        return result  # job dict
+
+    @mcp.tool()
+    def submit_route(
+        origin_lat: float,
+        origin_lon: float,
+        destination_lat: float,
+        destination_lon: float,
+        modes: list[str] | None = None,
+        force_strategy: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit a route plan as a background job. Poll with get_job."""
+        return container.plan_route.submit(
             origin_lat=origin_lat,
             origin_lon=origin_lon,
             destination_lat=destination_lat,
             destination_lon=destination_lon,
             modes=modes,
+            force_strategy=force_strategy,
         )
-        return result.model_dump()
+
+    @mcp.tool()
+    def get_job(job_id: str) -> dict[str, Any]:
+        """Get status/result of a deferred job (plan_route / submit_route)."""
+        job = container.jobs.get(job_id)
+        if job is None:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        return job.to_dict()
+
+    @mcp.tool()
+    def cancel_job(job_id: str) -> dict[str, Any]:
+        """Request cancellation of a queued/running job."""
+        job = container.jobs.cancel(job_id)
+        if job is None:
+            raise ValueError(f"Unknown job_id: {job_id}")
+        return job.to_dict()
+
+    @mcp.tool()
+    def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
+        """List recent background jobs."""
+        return [j.to_dict() for j in container.jobs.list_jobs(limit=limit)]
 
     @mcp.tool()
     def find_nearby(
@@ -127,7 +219,7 @@ def create_mcp_server(container: AppContainer | None = None) -> FastMCP:
         lon: float,
         kind: str | None = None,
     ) -> dict[str, Any]:
-        """Snap a coordinate to the nearest loaded graph node (intersection or stop)."""
+        """Snap a coordinate to the nearest graph node (auto-loads a local tile if needed)."""
         return container.snap_to_network.execute(lat=lat, lon=lon, kind=kind).model_dump()
 
     return mcp

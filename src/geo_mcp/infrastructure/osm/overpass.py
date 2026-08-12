@@ -9,6 +9,11 @@ from geo_mcp.domain.model.geo import BoundingBox, GeoPoint
 from geo_mcp.domain.model.place import PointOfInterest
 from geo_mcp.domain.model.transit import TransitLine, TransitStop
 from geo_mcp.infrastructure.config import Settings
+from geo_mcp.infrastructure.resilience import (
+    CircuitBreaker,
+    CircuitOpenError,
+    RetryPolicy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,19 @@ class OverpassClient:
             timeout=settings.http_timeout_s,
         )
         self._owns_client = client is None
+        self._retry = RetryPolicy(
+            max_attempts=settings.overpass_retries + 1,
+            base_delay_s=settings.retry_base_delay_s,
+            max_delay_s=settings.retry_max_delay_s,
+        )
+        self._breakers: dict[str, CircuitBreaker] = {
+            url: CircuitBreaker(
+                failure_threshold=settings.circuit_failure_threshold,
+                recovery_timeout_s=settings.circuit_recovery_timeout_s,
+                name=f"overpass:{url}",
+            )
+            for url in self._endpoints()
+        }
 
     def close(self) -> None:
         if self._owns_client:
@@ -62,21 +80,41 @@ class OverpassClient:
     def _query(self, ql: str) -> dict[str, Any]:
         last_error: Exception | None = None
         for url in self._endpoints():
-            for attempt in range(self._settings.overpass_retries + 1):
-                try:
-                    response = self._client.post(url, data={"data": ql})
-                    response.raise_for_status()
-                    return response.json()
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning(
-                        "Overpass query failed (%s attempt %s): %s",
-                        url,
-                        attempt + 1,
-                        exc,
-                    )
+            breaker = self._breakers.setdefault(
+                url,
+                CircuitBreaker(
+                    failure_threshold=self._settings.circuit_failure_threshold,
+                    recovery_timeout_s=self._settings.circuit_recovery_timeout_s,
+                    name=f"overpass:{url}",
+                ),
+            )
+            try:
+                breaker.guard()
+            except CircuitOpenError as exc:
+                last_error = exc
+                logger.warning("Skipping open circuit %s", url)
+                continue
+
+            def _once(endpoint: str = url) -> dict[str, Any]:
+                response = self._client.post(endpoint, data={"data": ql})
+                response.raise_for_status()
+                return response.json()
+
+            try:
+                data = self._retry_call_for(url, _once)
+                breaker.record_success()
+                return data
+            except Exception as exc:
+                breaker.record_failure()
+                last_error = exc
+                logger.warning("Overpass query failed on %s: %s", url, exc)
         assert last_error is not None
         raise last_error
+
+    def _retry_call_for(self, url: str, fn):
+        from geo_mcp.infrastructure.resilience import retry_call
+
+        return retry_call(fn, policy=self._retry, label=f"overpass:{url}")
 
     def fetch_transit(self, bbox: BoundingBox) -> tuple[list[TransitStop], list[TransitLine]]:
         b = f"{bbox.south},{bbox.west},{bbox.north},{bbox.east}"

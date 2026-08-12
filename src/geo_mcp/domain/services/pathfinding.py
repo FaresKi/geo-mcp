@@ -4,8 +4,9 @@ import heapq
 from collections.abc import Iterable
 
 from geo_mcp.domain.model.geo import GeoPoint
-from geo_mcp.domain.model.network import EdgeMode, NetworkGraph
+from geo_mcp.domain.model.network import EdgeMode, GraphEdge, NetworkGraph
 from geo_mcp.domain.model.route import Itinerary, RouteLeg
+from geo_mcp.domain.services.transit_costs import ROUTE_SPEED_MPS
 
 
 class PathfindingError(Exception):
@@ -21,10 +22,13 @@ class PathfindingService:
         walk_speed_mps: float = 1.4,
         transit_speed_mps: float = 8.0,
         transfer_penalty_s: float = 60.0,
+        line_change_penalty_s: float = 180.0,
     ) -> None:
         self.walk_speed_mps = walk_speed_mps
         self.transit_speed_mps = transit_speed_mps
         self.transfer_penalty_s = transfer_penalty_s
+        # Penalize hopping between different line_ref values mid-journey.
+        self.line_change_penalty_s = line_change_penalty_s
 
     def find_path(
         self,
@@ -39,77 +43,161 @@ class PathfindingService:
         if EdgeMode.TRANSIT in modes:
             modes.add(EdgeMode.TRANSFER)
 
-        origin_match = graph.nearest_node(origin)
-        dest_match = graph.nearest_node(destination)
+        origin_match = graph.nearest_node(origin, max_radius_m=max_snap_m)
+        dest_match = graph.nearest_node(destination, max_radius_m=max_snap_m)
         if origin_match is None or dest_match is None:
-            raise PathfindingError("Graph has no nodes to snap to")
-
-        start, start_dist = origin_match
-        end, end_dist = dest_match
-        if start_dist > max_snap_m or end_dist > max_snap_m:
             raise PathfindingError(
-                f"Could not snap endpoints to network within {max_snap_m}m "
-                f"(origin={start_dist:.0f}m, dest={end_dist:.0f}m)"
+                f"Could not snap endpoints to network within {max_snap_m}m"
             )
 
-        path_edges = self._astar(graph, start.id, end.id, modes)
+        start, _ = origin_match
+        end, _ = dest_match
+        path_edges = self._astar(graph, {start.id: 0.0}, {end.id}, modes)
         if path_edges is None:
             raise PathfindingError("No path found between snapped nodes")
 
         return self._build_itinerary(graph, path_edges, start.id, end.id)
 
-    def _edge_cost(self, mode: EdgeMode, travel_time_s: float) -> float:
-        if mode == EdgeMode.TRANSFER:
-            return travel_time_s + self.transfer_penalty_s
-        return travel_time_s
+    def find_path_between_sets(
+        self,
+        graph: NetworkGraph,
+        sources: dict[str, float],
+        goals: set[str],
+        *,
+        allowed_modes: Iterable[EdgeMode] | None = None,
+        goal_point: GeoPoint | None = None,
+    ) -> Itinerary:
+        """Multi-source / multi-sink search. ``sources`` maps node_id → seed cost."""
+        modes = set(allowed_modes or (EdgeMode.WALK, EdgeMode.TRANSIT, EdgeMode.TRANSFER))
+        if EdgeMode.TRANSIT in modes:
+            modes.add(EdgeMode.TRANSFER)
+        if not sources or not goals:
+            raise PathfindingError("Empty source or goal set")
+        path_edges = self._astar(graph, sources, goals, modes, goal_point=goal_point)
+        if path_edges is None:
+            raise PathfindingError("No path found between stop sets")
+        start_id = path_edges[0].source_id if path_edges else next(iter(sources))
+        end_id = path_edges[-1].target_id if path_edges else next(iter(goals))
+        if not path_edges:
+            start_id = next(iter(sources.keys() & goals))
+            end_id = start_id
+        return self._build_itinerary(graph, path_edges, start_id, end_id)
+
+    def _edge_cost(
+        self,
+        edge: GraphEdge,
+        *,
+        prev_line: str | None,
+    ) -> float:
+        cost = edge.travel_time_s
+        if edge.mode == EdgeMode.TRANSFER:
+            return cost + self.transfer_penalty_s
+        if (
+            edge.mode == EdgeMode.TRANSIT
+            and prev_line is not None
+            and edge.line_ref
+            and edge.line_ref != prev_line
+        ):
+            return cost + self.line_change_penalty_s
+        return cost
+
+    def _heuristic_speed(self, modes: set[EdgeMode]) -> float:
+        if EdgeMode.TRANSIT not in modes:
+            return self.walk_speed_mps
+        # Admissible: use the fastest configured rail speed.
+        return max(self.transit_speed_mps, max(ROUTE_SPEED_MPS.values()))
 
     def _astar(
         self,
         graph: NetworkGraph,
-        start_id: str,
-        goal_id: str,
+        sources: dict[str, float],
+        goals: set[str],
         modes: set[EdgeMode],
+        *,
+        goal_point: GeoPoint | None = None,
     ) -> list | None:
-        goal = graph.nodes[goal_id]
+        if goal_point is None:
+            pts = [graph.nodes[g].point for g in goals if g in graph.nodes]
+            if pts:
+                goal_point = GeoPoint(
+                    lat=sum(p.lat for p in pts) / len(pts),
+                    lon=sum(p.lon for p in pts) / len(pts),
+                )
+
+        h_speed = self._heuristic_speed(modes)
 
         def heuristic(node_id: str) -> float:
+            if goal_point is None:
+                return 0.0
             node = graph.nodes[node_id]
-            speed = (
-                self.transit_speed_mps
-                if EdgeMode.TRANSIT in modes
-                else self.walk_speed_mps
-            )
-            return node.point.distance_meters(goal.point) / speed
+            return node.point.distance_meters(goal_point) / h_speed
 
-        open_heap: list[tuple[float, float, str]] = [(heuristic(start_id), 0.0, start_id)]
-        came_from: dict[str, tuple[str, object]] = {}
-        g_score: dict[str, float] = {start_id: 0.0}
-        closed: set[str] = set()
+        # State = (node_id, active_line) where active_line is "" when not on a line.
+        open_heap: list[tuple[float, float, str, str]] = []
+        came_from: dict[tuple[str, str], tuple[tuple[str, str], GraphEdge]] = {}
+        g_score: dict[tuple[str, str], float] = {}
+        for sid, seed in sources.items():
+            if sid not in graph.nodes:
+                continue
+            state = (sid, "")
+            g_score[state] = seed
+            heapq.heappush(
+                open_heap, (seed + heuristic(sid), seed, sid, "")
+            )
+
+        if not open_heap:
+            return None
+
+        closed: set[tuple[str, str]] = set()
+        best_goal_state: tuple[str, str] | None = None
+        best_goal_cost = float("inf")
 
         while open_heap:
-            _, cost, current = heapq.heappop(open_heap)
-            if current in closed:
+            _, cost, current, line = heapq.heappop(open_heap)
+            state = (current, line)
+            if state in closed:
                 continue
-            if current == goal_id:
-                return self._reconstruct(came_from, current)
-            closed.add(current)
+            if current in goals and cost < best_goal_cost:
+                best_goal_state = state
+                best_goal_cost = cost
+                if open_heap and open_heap[0][0] >= best_goal_cost:
+                    break
+                if len(goals) == 1:
+                    break
+            closed.add(state)
 
+            prev_line = line or None
             for edge in graph.neighbors(current):
                 if edge.mode not in modes:
                     continue
-                tentative = cost + self._edge_cost(edge.mode, edge.travel_time_s)
+                tentative = cost + self._edge_cost(edge, prev_line=prev_line)
                 neighbor = edge.target_id
-                if tentative >= g_score.get(neighbor, float("inf")):
+                if edge.mode == EdgeMode.TRANSIT and edge.line_ref:
+                    next_line = edge.line_ref
+                else:
+                    next_line = ""
+                nstate = (neighbor, next_line)
+                if tentative >= g_score.get(nstate, float("inf")):
                     continue
-                g_score[neighbor] = tentative
-                came_from[neighbor] = (current, edge)
+                g_score[nstate] = tentative
+                came_from[nstate] = (state, edge)
                 f = tentative + heuristic(neighbor)
-                heapq.heappush(open_heap, (f, tentative, neighbor))
+                heapq.heappush(
+                    open_heap, (f, tentative, neighbor, next_line)
+                )
 
-        return None
+        if best_goal_state is None:
+            return None
+        if best_goal_state[0] in sources and best_goal_state not in came_from:
+            return []
+        return self._reconstruct(came_from, best_goal_state)
 
-    def _reconstruct(self, came_from: dict, current: str) -> list:
-        edges = []
+    def _reconstruct(
+        self,
+        came_from: dict[tuple[str, str], tuple[tuple[str, str], GraphEdge]],
+        current: tuple[str, str],
+    ) -> list[GraphEdge]:
+        edges: list[GraphEdge] = []
         while current in came_from:
             prev, edge = came_from[current]
             edges.append(edge)
@@ -195,7 +283,7 @@ class PathfindingService:
             )
             node_ids.append(last.target_id)
 
-        transfer_count = sum(1 for leg in legs if leg.mode == EdgeMode.TRANSFER)
+        transfer_count = self._count_transfers(legs)
         total_distance = sum(leg.distance_m for leg in legs)
         total_duration = sum(leg.duration_s for leg in legs) + (
             transfer_count * self.transfer_penalty_s
@@ -209,6 +297,50 @@ class PathfindingService:
             total_duration_s=total_duration,
             transfer_count=transfer_count,
             narrative=narrative,
+            node_ids=tuple(node_ids),
+            modes_used=modes_used,
+        )
+
+    def _count_transfers(self, legs: list[RouteLeg]) -> int:
+        count = sum(1 for leg in legs if leg.mode == EdgeMode.TRANSFER)
+        prev_line: str | None = None
+        for leg in legs:
+            if leg.mode == EdgeMode.TRANSIT and leg.line_ref:
+                if prev_line is not None and leg.line_ref != prev_line:
+                    count += 1
+                prev_line = leg.line_ref
+            elif leg.mode in {EdgeMode.WALK, EdgeMode.TRANSFER}:
+                # Walking / platform transfer breaks the continuous line ride.
+                if leg.mode == EdgeMode.TRANSFER:
+                    prev_line = None
+        return count
+
+    def stitch(self, *parts: Itinerary) -> Itinerary:
+        """Concatenate itineraries into one narrative journey."""
+        legs: list[RouteLeg] = []
+        node_ids: list[str] = []
+        for part in parts:
+            if not part.legs:
+                continue
+            legs.extend(part.legs)
+            if not node_ids:
+                node_ids.extend(part.node_ids)
+            else:
+                node_ids.extend(part.node_ids[1:] if part.node_ids else [])
+        if not legs:
+            raise PathfindingError("Nothing to stitch")
+        transfer_count = self._count_transfers(legs)
+        total_distance = sum(leg.distance_m for leg in legs)
+        total_duration = sum(leg.duration_s for leg in legs) + (
+            transfer_count * self.transfer_penalty_s
+        )
+        modes_used = tuple(dict.fromkeys(leg.mode.value for leg in legs))
+        return Itinerary(
+            legs=tuple(legs),
+            total_distance_m=total_distance,
+            total_duration_s=total_duration,
+            transfer_count=transfer_count,
+            narrative=self._narrative(legs, total_duration),
             node_ids=tuple(node_ids),
             modes_used=modes_used,
         )
