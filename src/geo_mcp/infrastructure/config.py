@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from geo_mcp.domain.config import RoutingConfig
+
 
 # Well-known Geofabrik extracts (override with GEO_MCP_PBF_URL).
 GEOFABRIK_REGIONS: dict[str, str] = {
@@ -85,6 +87,23 @@ class Settings(BaseSettings):
         raise ValueError(
             f"Unknown pbf_region={self.pbf_region!r}; "
             f"known={sorted(GEOFABRIK_REGIONS)} or set GEO_MCP_PBF_URL"
+        )
+
+    def routing_config(self) -> RoutingConfig:
+        """Map env/settings into a framework-free config for application/domain."""
+        return RoutingConfig(
+            walk_speed_mps=self.walk_speed_mps,
+            local_max_m=self.local_max_m,
+            max_snap_m=self.max_snap_m,
+            access_radius_m=self.access_radius_m,
+            tile_size_deg=self.tile_size_deg,
+            max_walk_tiles=self.max_walk_tiles,
+            transit_bbox_pad_deg=self.transit_bbox_pad_deg,
+            transit_min_span_deg=self.transit_min_span_deg,
+            prefer_rail_access=self.prefer_rail_access,
+            operation_deadline_s=self.operation_deadline_s,
+            place_bbox_max_span_deg=self.place_bbox_max_span_deg,
+            default_area_half_size_deg=self.default_area_half_size_deg,
         )
 
 

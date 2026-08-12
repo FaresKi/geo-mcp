@@ -5,13 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from typing import Literal
 
+from geo_mcp.domain.deadline import Deadline
 from geo_mcp.domain.model.geo import BoundingBox, GeoPoint, TileId
 from geo_mcp.domain.model.network import EdgeMode, GraphEdge, GraphNode, NetworkGraph
 from geo_mcp.domain.model.transit import TransitLine, TransitStop
 from geo_mcp.domain.services.transit_costs import speed_for_route_mode
 from geo_mcp.infrastructure.config import Settings
 from geo_mcp.infrastructure.osm.network_repository import OsmNetworkRepository
-from geo_mcp.infrastructure.resilience.deadline import Deadline
 
 logger = logging.getLogger(__name__)
 

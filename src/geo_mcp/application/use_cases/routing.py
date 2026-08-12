@@ -5,21 +5,22 @@ from typing import Any
 
 from geo_mcp.application.dto import ItineraryDTO, SnapResultDTO
 from geo_mcp.application.mappers import itinerary_to_dto, point_to_dto
+from geo_mcp.application.services.adaptive_router import AdaptiveRouter
 from geo_mcp.application.services.job_service import Job, JobService
+from geo_mcp.application.session import AreaSession
+from geo_mcp.domain.config import RoutingConfig
+from geo_mcp.domain.deadline import Deadline
 from geo_mcp.domain.model.geo import GeoPoint
-from geo_mcp.domain.services.hierarchical_router import AdaptiveRouter
+from geo_mcp.domain.ports import TileGraphPort
 from geo_mcp.domain.services.pathfinding import PathfindingError
 from geo_mcp.domain.services.routing_strategy import RoutingStrategy
-from geo_mcp.infrastructure.config import Settings
-from geo_mcp.infrastructure.osm.network_repository import AreaSession
-from geo_mcp.infrastructure.resilience.deadline import Deadline
 
 
 @dataclass
 class PlanRouteUseCase:
     router: AdaptiveRouter
     jobs: JobService
-    settings: Settings
+    config: RoutingConfig
 
     def execute(
         self,
@@ -36,7 +37,7 @@ class PlanRouteUseCase:
         origin = GeoPoint(lat=origin_lat, lon=origin_lon)
         destination = GeoPoint(lat=destination_lat, lon=destination_lon)
         distance_m = origin.distance_meters(destination)
-        should_defer = defer or distance_m > self.settings.local_max_m * 3
+        should_defer = defer or distance_m > self.config.local_max_m * 3
 
         forced = None
         if force_strategy:
@@ -65,7 +66,7 @@ class PlanRouteUseCase:
                 destination,
                 modes=modes,
                 force_strategy=forced,
-                deadline=Deadline.from_seconds(self.settings.operation_deadline_s),
+                deadline=Deadline.from_seconds(self.config.operation_deadline_s),
                 on_progress=progress,
             )
         except PathfindingError as exc:
@@ -109,7 +110,7 @@ class PlanRouteUseCase:
             destination,
             modes=modes,
             force_strategy=forced,
-            deadline=Deadline.from_seconds(self.settings.operation_deadline_s),
+            deadline=Deadline.from_seconds(self.config.operation_deadline_s),
             on_progress=progress,
         )
         return itinerary_to_dto(itinerary).model_dump()
@@ -118,8 +119,8 @@ class PlanRouteUseCase:
 @dataclass
 class SnapToNetworkUseCase:
     session: AreaSession
-    router: AdaptiveRouter
-    settings: Settings
+    tiles: TileGraphPort
+    config: RoutingConfig
 
     def execute(self, *, lat: float, lon: float, kind: str | None = None) -> SnapResultDTO:
         point = GeoPoint(lat=lat, lon=lon)
@@ -127,7 +128,7 @@ class SnapToNetworkUseCase:
         if graph is None or (
             self.session.bbox is not None and not self.session.bbox.contains(point)
         ):
-            graph = self.router.tiles.load_walk_around(point, ring=0)
+            graph = self.tiles.load_walk_around(point, ring=0)
             self.session.graph = graph
             self.session.bbox = graph.bbox
             self.session.label = self.session.label or "snap_tiles"

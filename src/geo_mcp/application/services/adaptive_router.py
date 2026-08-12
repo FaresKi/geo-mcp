@@ -4,19 +4,19 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from geo_mcp.application.session import AreaSession
+from geo_mcp.domain.config import RoutingConfig
+from geo_mcp.domain.deadline import Deadline
 from geo_mcp.domain.model.geo import BoundingBox, GeoPoint
 from geo_mcp.domain.model.network import EdgeMode, NetworkGraph
 from geo_mcp.domain.model.route import Itinerary, RouteLeg
+from geo_mcp.domain.ports import TileGraphPort
 from geo_mcp.domain.services.pathfinding import PathfindingError, PathfindingService
 from geo_mcp.domain.services.routing_strategy import (
     RoutingStrategy,
     RoutingStrategySelector,
 )
 from geo_mcp.domain.services.transit_costs import stop_rail_bonus
-from geo_mcp.infrastructure.config import Settings
-from geo_mcp.infrastructure.graph.tile_store import TileGraphStore
-from geo_mcp.infrastructure.osm.network_repository import AreaSession
-from geo_mcp.infrastructure.resilience.deadline import Deadline
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +27,8 @@ ProgressFn = Callable[[float, float | None, str], None]
 class AdaptiveRouter:
     """Distance-adaptive router: local multimodal A* or hierarchical transit-first."""
 
-    settings: Settings
-    tiles: TileGraphStore
+    config: RoutingConfig
+    tiles: TileGraphPort
     pathfinder: PathfindingService
     selector: RoutingStrategySelector
     session: AreaSession
@@ -46,7 +46,12 @@ class AdaptiveRouter:
         decision = self.selector.decide(
             origin, destination, modes=modes, force=force_strategy
         )
-        self._progress(on_progress, 5, 100, f"strategy={decision.strategy.value} ({decision.reason})")
+        self._progress(
+            on_progress,
+            5,
+            100,
+            f"strategy={decision.strategy.value} ({decision.reason})",
+        )
 
         allowed = self._map_modes(modes)
         if decision.strategy == RoutingStrategy.LOCAL:
@@ -74,7 +79,6 @@ class AdaptiveRouter:
         deadline: Deadline | None,
         on_progress: ProgressFn | None,
     ) -> Itinerary:
-        # Prefer already-loaded session graph when both points are inside.
         graph = self.session.graph
         if (
             graph is not None
@@ -86,9 +90,11 @@ class AdaptiveRouter:
         else:
             self._progress(on_progress, 15, 100, "Loading local walk+transit tiles")
             bbox = BoundingBox.from_points(
-                origin, destination, pad_deg=self.settings.tile_size_deg
+                origin, destination, pad_deg=self.config.tile_size_deg
             )
-            tiles = self.tiles.tiles_for_bbox(bbox, max_tiles=self.settings.max_walk_tiles)
+            tiles = self.tiles.tiles_for_bbox(
+                bbox, max_tiles=self.config.max_walk_tiles
+            )
             graph = self.tiles.load_tiles(
                 tiles,
                 layer="full",
@@ -105,7 +111,7 @@ class AdaptiveRouter:
             origin,
             destination,
             allowed_modes=allowed_modes,
-            max_snap_m=self.settings.max_snap_m,
+            max_snap_m=self.config.max_snap_m,
         )
         self._progress(on_progress, 100, 100, "Route ready")
         return itinerary
@@ -119,9 +125,10 @@ class AdaptiveRouter:
         deadline: Deadline | None,
         on_progress: ProgressFn | None,
     ) -> Itinerary:
-        modes = set(allowed_modes or (EdgeMode.WALK, EdgeMode.TRANSIT, EdgeMode.TRANSFER))
+        modes = set(
+            allowed_modes or (EdgeMode.WALK, EdgeMode.TRANSIT, EdgeMode.TRANSFER)
+        )
         if EdgeMode.TRANSIT not in modes:
-            # Hierarchical needs transit; fall back to expanding local tiles.
             return self._route_local(
                 origin,
                 destination,
@@ -130,7 +137,7 @@ class AdaptiveRouter:
                 on_progress=on_progress,
             )
 
-        pad = self.settings.transit_bbox_pad_deg
+        pad = self.config.transit_bbox_pad_deg
         corridor = BoundingBox.from_points(origin, destination, pad_deg=pad)
         corridor = self._widen_corridor(corridor)
         self._progress(on_progress, 10, 100, "Fetching transit skeleton")
@@ -164,7 +171,9 @@ class AdaptiveRouter:
         )
 
         board_id = transit_itin.node_ids[0] if transit_itin.node_ids else access[0][0].id
-        alight_id = transit_itin.node_ids[-1] if transit_itin.node_ids else egress[0][0].id
+        alight_id = (
+            transit_itin.node_ids[-1] if transit_itin.node_ids else egress[0][0].id
+        )
         board_stop = transit_graph.nodes[board_id]
         alight_stop = transit_graph.nodes[alight_id]
 
@@ -181,7 +190,6 @@ class AdaptiveRouter:
         )
 
         self._progress(on_progress, 90, 100, "Stitching itinerary")
-        # Build synthetic walk legs when tile routing fails but geodesic is known.
         parts: list[Itinerary] = []
         if access_leg is not None:
             parts.append(access_leg)
@@ -194,8 +202,7 @@ class AdaptiveRouter:
         return itinerary
 
     def _widen_corridor(self, bbox: BoundingBox) -> BoundingBox:
-        """Ensure the transit clip is wide enough to include hub stations."""
-        min_span = getattr(self.settings, "transit_min_span_deg", 0.08)
+        min_span = self.config.transit_min_span_deg
         lat_span, lon_span = bbox.spans()
         south, west, north, east = bbox.south, bbox.west, bbox.north, bbox.east
         if lat_span < min_span:
@@ -215,13 +222,13 @@ class AdaptiveRouter:
         *,
         limit: int = 16,
     ) -> list[tuple]:
-        radius = self.settings.access_radius_m * 2
+        radius = self.config.access_radius_m * 2
         candidates = transit_graph.nearest_stops(
             point, limit=max(limit * 2, 24), max_radius_m=radius
         )
         if not candidates:
             return []
-        if not getattr(self.settings, "prefer_rail_access", True):
+        if not self.config.prefer_rail_access:
             return candidates[:limit]
 
         rail = [
@@ -234,27 +241,20 @@ class AdaptiveRouter:
             for n, d in candidates
             if not stop_rail_bonus(n.tags.get("modes"))
         ]
-        # Prefer rail stops that actually expose a line ref (skip bare stations).
         rail.sort(
             key=lambda nd: (
                 0 if (nd[0].tags.get("lines") or "").strip() else 1,
                 nd[1],
             )
         )
-        ordered = rail + other
-        return ordered[:limit]
+        return (rail + other)[:limit]
 
     def _access_seed_cost(self, node, dist_m: float) -> float:
-        """Walk time to stop, with a bonus for rail/metro boarding."""
-        cost = dist_m / self.settings.walk_speed_mps
-        if getattr(self.settings, "prefer_rail_access", True) and stop_rail_bonus(
-            node.tags.get("modes")
-        ):
-            cost *= 0.35  # strongly prefer RER/metro boarding
-            # Prefer stops tagged with real line refs (B, 14, …) over empty hubs.
+        cost = dist_m / self.config.walk_speed_mps
+        if self.config.prefer_rail_access and stop_rail_bonus(node.tags.get("modes")):
+            cost *= 0.35
             if (node.tags.get("lines") or "").strip():
                 cost *= 0.7
-            # Orlyval / airport shuttles are poor access for city trips.
             lines = (node.tags.get("lines") or "").lower()
             if "orlyval" in lines:
                 cost *= 4.0
@@ -298,12 +298,11 @@ class AdaptiveRouter:
                     origin,
                     destination,
                     allowed_modes=[EdgeMode.WALK],
-                    max_snap_m=self.settings.max_snap_m,
+                    max_snap_m=self.config.max_snap_m,
                 )
             except PathfindingError:
                 pass
-        # Geodesic walk fallback so hierarchical routes still complete.
-        duration = dist / self.settings.walk_speed_mps
+        duration = dist / self.config.walk_speed_mps
         leg = RouteLeg(
             mode=EdgeMode.WALK,
             distance_m=dist,
